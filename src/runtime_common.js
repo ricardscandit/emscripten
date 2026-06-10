@@ -13,11 +13,30 @@
 #endif
 
 #if SHARED_MEMORY && ALLOW_MEMORY_GROWTH && !GROWABLE_ARRAYBUFFERS
+// Fresh SAB published by the most recent successful wasmMemory.grow() on any
+// thread (see $growMemory in lib/libcore.js) and broadcast to every other
+// pthread worker via postMessage (see the worker / main-thread dispatchers in
+// runtime_pthread.js / lib/libpthread.js). The pre-existing identity-compare
+// in growMemViews below (`wasmMemory.buffer != HEAP8.buffer`) has no
+// synchronization with the growing thread — the WebAssembly threads spec
+// doesn't oblige `Memory.prototype.buffer` to return the latest SAB to
+// threads that did not call grow themselves, so engines that cache or
+// memoize the getter (Chromium 149+ does, see
+// https://github.com/emscripten-core/emscripten/issues/27084) leave workers stuck
+// on a stale view. Subsequent Atomics.* at any post-grow address then throws
+// "Invalid atomic access index". The broadcast adds the explicit
+// cross-thread notification that the identity-compare always assumed.
+var freshSharedBuffer;
+
 // Support for growable heap + pthreads, where the buffer may change, so JS views
 // must be updated.
 function growMemViews() {
   // `updateMemoryViews` updates all the views simultaneously, so it's enough to check any of them.
-  if (wasmMemory.buffer != HEAP8.buffer) {
+  // Prefer the broadcast cache when set; relying on `wasmMemory.buffer` alone
+  // is racy under any engine that may return a stale buffer to non-growing
+  // workers (deterministically on Chromium 149+, latent on others).
+  var current = freshSharedBuffer || wasmMemory.buffer;
+  if (current != HEAP8.buffer) {
     updateMemoryViews();
   }
 }
@@ -111,6 +130,12 @@ var runtimeExited = false;
 function updateMemoryViews() {
 #if GROWABLE_ARRAYBUFFERS
   var b = wasmMemory.toResizableBuffer();
+#elif SHARED_MEMORY && ALLOW_MEMORY_GROWTH
+  // Prefer the buffer published by the most recent cross-thread grow
+  // broadcast when set; `wasmMemory.buffer` may be stale in non-growing
+  // workers (engine-dependent; deterministic on Chromium 149+, see
+  // https://github.com/emscripten-core/emscripten/issues/27084).
+  var b = freshSharedBuffer || wasmMemory.buffer;
 #else
   var b = wasmMemory.buffer;
 #endif

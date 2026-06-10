@@ -216,9 +216,49 @@ addToLibrary({
     try {
       // round size grow request up to wasm page size (fixed 64KB per spec)
       wasmMemory.grow({{{ toIndexType('pages') }}}); // .grow() takes a delta compared to the previous size
-#if !GROWABLE_ARRAYBUFFERS
+#if SHARED_MEMORY && ALLOW_MEMORY_GROWTH && !GROWABLE_ARRAYBUFFERS
+      // The growing thread sees a fresh SAB here. Other pthread workers do
+      // not necessarily see one: their `wasmMemory.buffer` getter is not
+      // required by the spec to return a SAB reflecting a grow done on
+      // another thread, and engines that cache/memoize the getter
+      // (deterministically on Chromium 149+, see
+      // https://github.com/emscripten-core/emscripten/issues/27084) keep
+      // them pinned to the pre-grow snapshot. Cache the fresh SAB locally so
+      // updateMemoryViews / growMemViews can use it.
+      var newBuf = wasmMemory.buffer;
+      freshSharedBuffer = newBuf;
       updateMemoryViews();
-#endif
+#if PTHREADS
+      // The original `wasmMemory.buffer != HEAP8.buffer` check in growMemViews
+      // is the only synchronization between this grow and a sibling worker's
+      // next Atomics.* call — and it has no actual cross-thread guarantee.
+      // Add an explicit notification: broadcast the fresh SAB to every other
+      // pthread worker so they rebuild their HEAP* views from it. Without
+      // this, Atomics.* in any worker that hasn't observed the new buffer
+      // will throw "Invalid atomic access index" on a post-grow address and
+      // the worker dies uncaught.
+      try {
+        if (ENVIRONMENT_IS_PTHREAD) {
+          // From a pthread worker, ask the main thread to fan out.
+          postMessage({cmd: 'memBufferRefresh', buffer: newBuf});
+        } else if (typeof PThread !== 'undefined' && PThread && PThread.pthreads) {
+          // From the main thread, post directly to every running worker.
+          for (var tid in PThread.pthreads) {
+            var w = PThread.pthreads[tid];
+            if (w && typeof w.postMessage === 'function') {
+              w.postMessage({cmd: 'memBufferRefresh', buffer: newBuf});
+            }
+          }
+        }
+      } catch (broadcastErr) {
+        // The grow itself succeeded; surface the broadcast failure but don't
+        // propagate. Other workers will hang on Atomics.* until the next grow.
+        err(`growMemory: failed to broadcast fresh SAB to workers: ${broadcastErr}`);
+      }
+#endif // PTHREADS
+#elif !GROWABLE_ARRAYBUFFERS
+      updateMemoryViews();
+#endif // SHARED_MEMORY && ALLOW_MEMORY_GROWTH && !GROWABLE_ARRAYBUFFERS
 #if MEMORYPROFILER
       if (typeof emscriptenMemoryProfiler != 'undefined') {
         emscriptenMemoryProfiler.onMemoryResize(oldHeapSize, wasmMemory.buffer.byteLength);

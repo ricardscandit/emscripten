@@ -300,6 +300,39 @@ var LibraryPThread = {
           return;
         }
 
+#if SHARED_MEMORY && ALLOW_MEMORY_GROWTH && !GROWABLE_ARRAYBUFFERS
+        if (cmd === 'memBufferRefresh') {
+          // A pthread worker just grew wasm memory (see $growMemory in
+          // lib/libcore.js) and sent us the fresh SAB so that views can be
+          // rebuilt explicitly rather than relying on every worker's
+          // `wasmMemory.buffer` getter to spontaneously start returning a
+          // fresh buffer — which the spec does not guarantee and engines
+          // that cache the getter (Chromium 149+, see
+          // https://github.com/emscripten-core/emscripten/issues/27084)
+          // do not do.
+          // Refresh our own views and fan the message out to every other
+          // worker.
+          try {
+            if (d.buffer) {
+              freshSharedBuffer = d.buffer;
+              if (typeof updateMemoryViews === 'function') updateMemoryViews();
+              for (var tid in PThread.pthreads) {
+                var otherWorker = PThread.pthreads[tid];
+                if (otherWorker && otherWorker !== worker &&
+                    typeof otherWorker.postMessage === 'function') {
+                  otherWorker.postMessage({cmd: 'memBufferRefresh', buffer: d.buffer});
+                }
+              }
+            }
+          } catch (e) {
+            // Don't let a failure here crash the main thread. Surface the
+            // problem; other workers may stay stuck until the next grow.
+            err(`memBufferRefresh fan-out failed: ${e}`);
+          }
+          return;
+        }
+#endif
+
         switch (cmd) {
           case {{{ CMD_CHECK_MAILBOX }}}:
             checkMailbox();

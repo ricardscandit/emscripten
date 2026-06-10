@@ -47,6 +47,31 @@ if (ENVIRONMENT_IS_PTHREAD) {
       var msgData = e.data;
       //dbg('msgData: ' + Object.keys(msgData));
       var cmd = msgData.cmd;
+#if SHARED_MEMORY && ALLOW_MEMORY_GROWTH && !GROWABLE_ARRAYBUFFERS
+      if (cmd === 'memBufferRefresh') {
+        // Another thread grew the wasm memory and broadcast the fresh SAB
+        // (see $growMemory in lib/libcore.js). Stash it and rebuild our
+        // HEAP* views. The Wasm-threads spec does not guarantee that this
+        // worker's own `wasmMemory.buffer` getter would observe the new
+        // SAB — engines that cache the getter (Chromium 149+, see
+        // https://github.com/emscripten-core/emscripten/issues/27084)
+        // leave it pinned to the pre-grow snapshot, so without this
+        // explicit notification, the next Atomics.* on a post-grow address
+        // throws "Invalid atomic access index" and the worker dies
+        // uncaught.
+        try {
+          if (msgData.buffer) {
+            freshSharedBuffer = msgData.buffer;
+            if (typeof updateMemoryViews === 'function') updateMemoryViews();
+          }
+        } catch (e) {
+          // Don't let a failure here crash the worker; log it so the issue
+          // is at least visible to anyone watching the console.
+          err(`worker: memBufferRefresh handler failed: ${e}`);
+        }
+        return;
+      }
+#endif
       if (cmd == {{{ CMD_LOAD }}}) { // Preload command that is called once per worker to parse and load the Emscripten code.
 #if ASSERTIONS
         workerID = msgData.workerID;
